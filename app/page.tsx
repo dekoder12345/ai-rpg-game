@@ -9,14 +9,22 @@ import { Separator } from '@/components/ui/separator'
 import { Axe, BookOpen, Coins, Dice5, FlaskConical, Heart, Home, Menu, MessageSquare, Shield, Swords, SwordsIcon, Wand2, Waypoints } from 'lucide-react'
 import Image from 'next/image'
 import { cn } from '@/lib/utils'
-import { type GameClass, type GameSave, type GameState, defaultStatsFor, emptyGameState, initialInventory, statLabel } from '@/lib/game'
+import { WORLDS, type GameClass, type GameSave, type GameState, type Player, createPlayer, defaultStatsFor, emptyGameState, statLabel } from '@/lib/game'
 import { useAudio } from '@/lib/sfx'
 
 function useLocalStorage<T>(key: string, initial: T) {
   const [val, setVal] = useState<T>(() => {
     if (typeof window === 'undefined') return initial
     const raw = localStorage.getItem(key)
-    return raw ? (JSON.parse(raw) as T) : initial
+    if (!raw) return initial
+    try {
+      const parsed = JSON.parse(raw)
+      // Migration: enforce stateVersion 2
+      if ((parsed as any)?.stateVersion === 2) return parsed as T
+      return initial
+    } catch {
+      return initial
+    }
   })
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -44,91 +52,100 @@ const QUICK_ACTIONS = [
   { key: 'use', label: 'Użyj przedmiotu', icon: FlaskConical },
 ]
 
+type Screen = 'hero' | 'world' | 'team' | 'game'
+
 export default function Page() {
-  const [screen, setScreen] = useLocalStorage<'hero' | 'select' | 'game'>('rpg_screen', 'hero')
+  const [screen, setScreen] = useLocalStorage<Screen>('rpg_screen', 'hero')
   const [state, setState] = useLocalStorage<GameState>('rpg_state', emptyGameState())
-  const [input, setInput] = useState('')
+  const [isSending, setIsSending] = useState(false)
   const [rolling, setRolling] = useState(false)
   const [rollResult, setRollResult] = useState<number | null>(null)
-  const [isSending, setIsSending] = useState(false)
   const [nav, setNav] = useState<'create' | 'saved' | 'explore'>('create')
 
   const sessionId = useMemo(() => ensureSessionId(), [])
   const clickSfx = useAudio('/audio/click.mp3', 0.7)
   const diceSfx = useAudio('/audio/dice.mp3', 0.9)
 
-  function resetGameForClass(cls: GameClass) {
+  useEffect(() => {
+    document.documentElement.classList.add('antialiased')
+  }, [])
+
+  function resetToWorld() {
     const base = emptyGameState()
-    base.playerClass = cls
-    base.stats = defaultStatsFor(cls)
-    base.inventory = initialInventory(cls)
-    base.messages = [
-      { role: 'system', content: 'Mistrz Gry: Witaj w leśnej krainie. Wybierz drogę mądrze...' },
-    ]
     setState(base)
+    setScreen('world')
   }
 
-  function startAdventure(cls: GameClass) {
-    clickSfx.play()
-    resetGameForClass(cls)
-    setScreen('game')
-    void sendToAI('(Rozpocznij przygodę i przedstaw cel misji.)', null, true)
-  }
-
-  function saveCurrent() {
-    clickSfx.play()
-    const snapshot: GameSave = {
-      id: crypto.randomUUID(),
-      name: `Przygoda ${new Date().toLocaleString()}`,
-      createdAt: Date.now(),
-      state,
+  async function generateStory(worldKey: string, players: Player[]) {
+    // store world and players first
+    const world = WORLDS[worldKey as keyof typeof WORLDS]
+    const base: GameState = {
+      ...emptyGameState(),
+      world,
+      players,
+      activeIndex: 0,
+      messages: [{ role: 'system', content: 'Mistrz Gry: Witajcie w leśnej krainie. Wasza ścieżka dopiero się zaczyna...' }],
     }
-    const saves = JSON.parse(localStorage.getItem('rpg_saves') || '[]') as GameSave[]
-    const next = [snapshot, ...saves].slice(0, 20)
-    localStorage.setItem('rpg_saves', JSON.stringify(next))
-    fetch('/api/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId, save: snapshot }),
-    }).catch(() => {})
-  }
+    setState(base)
 
-  async function sendToAI(action: string, dice: number | null, isIntro = false) {
-    setIsSending(true)
+    // ask server for outline
     try {
-      const body = { sessionId, playerAction: action, diceRoll: dice, gameState: state, isIntro }
-      const res = await fetch('/api/ai', {
+      const res = await fetch('/api/story', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          sessionId,
+          worldKey,
+          players: players.map(p => ({ name: p.name, cls: p.cls })),
+        }),
       })
       const data = await res.json()
+      const outline = data.outline || null
+      const withStory = { ...base, story: outline }
+      setState(withStory)
+      // intro
+      await sendToAI('(Rozpocznij przygodę zgodnie z zarysem historii.)', null, true, 0, withStory)
+      setScreen('game')
+    } catch {
+      // fallback to game without outline
+      await sendToAI('(Rozpocznij przygodę.)', null, true, 0, base)
+      setScreen('game')
+    }
+  }
+
+  async function sendToAI(action: string, dice: number | null, isIntro = false, playerIndex = 0, s?: GameState) {
+    const st = s ?? state
+    setIsSending(true)
+    try {
+      const body = { sessionId, playerAction: action, diceRoll: dice, gameState: st, isIntro, playerIndex }
+      const res = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const data = await res.json()
       const messages = [
-        ...state.messages,
-        ...(action && !isIntro ? [{ role: 'user' as const, content: `Gracz: ${action}` }] : []),
+        ...st.messages,
+        ...(action && !isIntro ? [{ role: 'user' as const, content: `(${st.players[playerIndex]?.name}): ${action}` }] : []),
         { role: 'assistant' as const, content: data.narration },
       ]
-      const eff = (data.effects ?? {}) as Partial<GameState>
-      const next: GameState = {
-        ...state,
-        messages,
-        hp: Math.max(0, eff.hp ?? state.hp),
-        mana: Math.max(0, eff.mana ?? state.mana),
-        stats: eff.stats ?? state.stats,
-        inventory: eff.inventory ?? state.inventory,
-        questLog: eff.questLog ?? state.questLog,
-        goal: eff.goal ?? state.goal,
-        isOver: eff.isOver ?? state.isOver,
-        outcome: eff.outcome ?? state.outcome,
+      const next: GameState = { ...(s ?? state), messages }
+      // Server already applied effects in session and returned only narration/effects. For client mirror, fetch session? For demo, also apply quickly here:
+      const eff = data.effects || {}
+      const actor = next.players[playerIndex]
+      if (actor) {
+        if (typeof eff.actorHp === 'number') actor.hp = Math.max(0, Math.min(actor.stats.hpBase, eff.actorHp))
+        if (typeof eff.actorMana === 'number') actor.mana = Math.max(0, Math.min(actor.stats.manaBase, eff.actorMana))
+        if (Array.isArray(eff.actorInventory)) actor.inventory = eff.actorInventory
+        if (Array.isArray(eff.actorAddItems)) eff.actorAddItems.forEach((it: string) => { if (!actor.inventory.includes(it)) actor.inventory.push(it) })
+        if (Array.isArray(eff.actorRemoveItems)) actor.inventory = actor.inventory.filter(i => !eff.actorRemoveItems.includes(i))
       }
+      if (typeof eff.goal === 'string') next.goal = eff.goal
+      if (Array.isArray(eff.questLog)) next.questLog = eff.questLog
+      if (typeof eff.isOver === 'boolean') next.isOver = eff.isOver
+      if (typeof eff.outcome === 'string') next.outcome = eff.outcome
+
       setState(next)
-      fetch('/api/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, state: next }),
-      }).catch(() => {})
-    } catch (e) {
-      const messages = [...state.messages, { role: 'assistant' as const, content: 'MG: Coś poszło nie tak z magią Orakla. Spróbuj ponownie.' }]
+      // mirror to backend session (demo)
+      fetch('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, state: next }) }).catch(() => {})
+    } catch {
+      const messages = [...state.messages, { role: 'assistant' as const, content: 'MG: Zakłócenia w echa Orakla. Spróbuj ponownie.' }]
       setState({ ...state, messages })
     } finally {
       setIsSending(false)
@@ -136,6 +153,8 @@ export default function Page() {
   }
 
   async function rollAndSend(baseAction: string) {
+    const actor = state.players[state.activeIndex]
+    if (!actor) return
     diceSfx.play()
     setRolling(true)
     const start = Date.now()
@@ -147,24 +166,13 @@ export default function Page() {
         clearInterval(interval)
         setRolling(false)
         setRollResult(current)
-        const relevant = guessRelevantStat(baseAction, state.playerClass)
-        const mod = state.stats[relevant] ?? 0
+        // choose relevant stat
+        const relevant = guessRelevantStat(baseAction, actor.cls)
+        const mod = actor.stats[relevant] ?? 0
         const total = current + mod
-        void sendToAI(`${baseAction} (rzucono k20=${current} + modyfikator ${statLabel(relevant)}=${mod} => wynik ${total})`, total, false)
+        void sendToAI(`${baseAction} (rzucono k20=${current} + modyfikator ${statLabel(relevant)}=${mod} => wynik ${total})`, total, false, state.activeIndex)
       }
     }, 60)
-  }
-
-  function guessRelevantStat(action: string, cls: GameClass | null) {
-    const a = action.toLowerCase()
-    if (a.includes('atak') || a.includes('cios') || a.includes('walcz')) return 'strength'
-    if (a.includes('rozm') || a.includes('persw') || a.includes('ucisz') || a.includes('negoc')) return 'wisdom'
-    if (a.includes('szuk') || a.includes('skr') || a.includes('unik') || a.includes('zwin')) return 'dexterity'
-    if (a.includes('czar') || a.includes('zakl') || a.includes('mag')) return 'wisdom'
-    if (cls === 'Wojownik') return 'strength'
-    if (cls === 'Łotrzyk') return 'dexterity'
-    if (cls === 'Mag' || cls === 'Zielarz') return 'wisdom'
-    return 'strength'
   }
 
   return (
@@ -175,18 +183,33 @@ export default function Page() {
           <Hero
             onStart={() => {
               clickSfx.play()
-              setScreen('select')
+              resetToWorld()
             }}
             onChooseCampaign={() => setNav('explore')}
           />
         )}
-        {screen === 'select' && <CharacterSelect onBack={() => setScreen('hero')} onSelect={(c) => startAdventure(c)} />}
+        {screen === 'world' && (
+          <WorldSelect
+            onBack={() => setScreen('hero')}
+            onNext={(worldKey, count) => setScreen('team') || setState({ ...state, world: WORLDS[worldKey], players: Array.from({ length: count }).map((_, i) => createPlayer(defaultName(i), 'Wojownik')) })}
+          />
+        )}
+        {screen === 'team' && state.world && (
+          <TeamSetup
+            worldKey={state.world.key}
+            players={state.players}
+            onBack={() => setScreen('world')}
+            onUpdate={(players) => setState({ ...state, players })}
+            onStart={() => generateStory(state.world!.key, state.players)}
+          />
+        )}
         {screen === 'game' && (
           <GameArea
             state={state}
-            onQuick={(a) => void rollAndSend(a)}
-            onSubmit={(actionText) => void rollAndSend(actionText)}
             isSending={isSending}
+            onQuick={(a) => void rollAndSend(a)}
+            onSubmit={(a) => void rollAndSend(a)}
+            onSetActive={(idx) => setState({ ...state, activeIndex: idx })}
           />
         )}
         {nav === 'saved' && <SavedList />}
@@ -196,6 +219,23 @@ export default function Page() {
       <Fireflies />
     </div>
   )
+}
+
+function defaultName(i: number) {
+  const names = ['Alder', 'Mira', 'Toran', 'Lysa']
+  return names[i % names.length]
+}
+
+function guessRelevantStat(action: string, cls: GameClass | null) {
+  const a = action.toLowerCase()
+  if (a.includes('atak') || a.includes('cios') || a.includes('walcz')) return 'strength'
+  if (a.includes('rozm') || a.includes('persw') || a.includes('ucisz') || a.includes('negoc')) return 'wisdom'
+  if (a.includes('szuk') || a.includes('skr') || a.includes('unik') || a.includes('zwin')) return 'dexterity'
+  if (a.includes('czar') || a.includes('zakl') || a.includes('mag')) return 'wisdom'
+  if (cls === 'Wojownik') return 'strength'
+  if (cls === 'Łotrzyk') return 'dexterity'
+  if (cls === 'Mag' || cls === 'Zielarz') return 'wisdom'
+  return 'strength'
 }
 
 function Header({
@@ -270,13 +310,9 @@ function Hero({ onStart, onChooseCampaign }: { onStart: () => void; onChooseCamp
   )
 }
 
-function CharacterSelect({ onSelect, onBack }: { onSelect: (cls: GameClass) => void; onBack: () => void }) {
-  const classes: { cls: GameClass; icon: any; desc: string }[] = [
-    { cls: 'Wojownik', icon: SwordsIcon, desc: 'Silny i wytrzymały wojownik, mistrz broni białej.' },
-    { cls: 'Mag', icon: Wand2, desc: 'Uczony mag, władający tajemną mocą lasu.' },
-    { cls: 'Łotrzyk', icon: Axe, desc: 'Zwinny i sprytny, cichy jak cień między drzewami.' },
-    { cls: 'Zielarz', icon: FlaskConical, desc: 'Znawca ziół i alchemii, leczy i zatruwa z równą gracją.' },
-  ]
+function WorldSelect({ onBack, onNext }: { onBack: () => void; onNext: (worldKey: keyof typeof WORLDS, count: number) => void }) {
+  const [selected, setSelected] = useState<keyof typeof WORLDS>('wiedzmin')
+  const [count, setCount] = useState(1)
   return (
     <section className="relative py-12">
       <div className="absolute inset-0">
@@ -284,28 +320,137 @@ function CharacterSelect({ onSelect, onBack }: { onSelect: (cls: GameClass) => v
       </div>
       <div className="relative mx-auto max-w-6xl px-4">
         <div className="flex items-center justify-between mb-6">
-          <h2 className="text-2xl md:text-3xl font-bold text-[#e8e0c7]">{'Wybór postaci'}</h2>
+          <h2 className="text-2xl md:text-3xl font-bold text-[#e8e0c7]">{'Wybierz świat i liczbę graczy'}</h2>
           <Button onClick={onBack} variant="secondary" className="bg-[#2f4a2f] text-[#f0e7cf] border border-[#1f2f1f]">{'Powrót'}</Button>
         </div>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {classes.map(({ cls, icon: Icon, desc }) => {
-            const stats = defaultStatsFor(cls)
+
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {(Object.keys(WORLDS) as (keyof typeof WORLDS)[]).map((key) => {
+            const w = WORLDS[key]
+            const active = key === selected
             return (
-              <Card key={cls} className="bg-[#162016]/90 border-[#3d3021]">
+              <Card key={key} className={cn('bg-[#162016]/90 border-[#3d3021] cursor-pointer', active && 'ring-2 ring-[#6e5b3d]')} onClick={() => setSelected(key)}>
                 <CardHeader className="pb-2">
-                  <CardTitle className="flex items-center gap-2 text-[#f0e7cf]"><Icon className="h-5 w-5" /> {cls}</CardTitle>
+                  <CardTitle className="text-[#f0e7cf]">{w.name}</CardTitle>
+                </CardHeader>
+                <CardContent className="text-[#d8cfb5] text-sm space-y-2">
+                  <p>{w.description}</p>
+                  <p className="text-[#9fb19f]">{w.styleHints}</p>
+                </CardContent>
+              </Card>
+            )
+          })}
+        </div>
+
+        <div className="mt-6 flex items-center gap-3">
+          <label className="text-[#e8e0c7]">{'Liczba graczy:'}</label>
+          <div className="flex items-center gap-2">
+            {[1,2,3,4].map(n => (
+              <Button key={n} onClick={() => setCount(n)} className={cn('bg-[#2f4a2f] text-[#f0e7cf] border border-[#1f2f1f]', count===n && 'bg-[#576f2e] hover:bg-[#4c6128]')}>
+                {n}
+              </Button>
+            ))}
+          </div>
+          <div className="ml-auto">
+            <Button onClick={() => onNext(selected, count)} className="bg-[#6e5b3d] hover:bg-[#5d4c32] text-[#f7f2e6]">
+              {'Dalej'}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function TeamSetup({
+  worldKey,
+  players,
+  onBack,
+  onUpdate,
+  onStart,
+}: {
+  worldKey: string
+  players: Player[]
+  onBack: () => void
+  onUpdate: (players: Player[]) => void
+  onStart: () => void
+}) {
+  function update(i: number, patch: Partial<Player>) {
+    const next = players.map((p, idx) => idx === i ? { ...p, ...patch } : p)
+    // if class changed, refresh stats/hp/mana/inventory
+    const np = next[i]
+    if (patch.cls) {
+      const cls = patch.cls as GameClass
+      const stats = defaultStatsFor(cls)
+      next[i] = { ...np, cls, stats, hp: stats.hpBase, mana: stats.manaBase, inventory: np.inventory?.length ? np.inventory : [] }
+    }
+    if (patch.name !== undefined && !patch.id) {
+      next[i] = { ...next[i], name: String(patch.name) }
+    }
+    onUpdate(next)
+  }
+
+  const classes: { cls: GameClass; icon: any; desc: string }[] = [
+    { cls: 'Wojownik', icon: SwordsIcon, desc: 'Silny i wytrzymały wojownik, mistrz broni białej.' },
+    { cls: 'Mag', icon: Wand2, desc: 'Uczony mag, władający tajemną mocą.' },
+    { cls: 'Łotrzyk', icon: Axe, desc: 'Zwinny i sprytny, cichy jak cień.' },
+    { cls: 'Zielarz', icon: FlaskConical, desc: 'Znawca ziół i alchemii.' },
+  ]
+
+  return (
+    <section className="relative py-12">
+      <div className="absolute inset-0">
+        <Image src="/images/forest-hero.png" alt="" fill className="object-cover opacity-20" />
+      </div>
+      <div className="relative mx-auto max-w-6xl px-4">
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-2xl md:text-3xl font-bold text-[#e8e0c7]">{'Ustaw drużynę'}</h2>
+          <div className="flex gap-2">
+            <Button onClick={onBack} variant="secondary" className="bg-[#2f4a2f] text-[#f0e7cf] border border-[#1f2f1f]">{'Powrót'}</Button>
+            <Button onClick={onStart} className="bg-[#6e5b3d] hover:bg-[#5d4c32] text-[#f7f2e6]">{'Rozpocznij'}</Button>
+          </div>
+        </div>
+
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {players.map((p, i) => {
+            const stats = p.stats
+            return (
+              <Card key={p.id} className="bg-[#162016]/90 border-[#3d3021]">
+                <CardHeader className="pb-2">
+                  <CardTitle className="flex items-center gap-2 text-[#f0e7cf]">
+                    {'Gracz '}{i+1}
+                  </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2 text-[#d8cfb5]">
-                  <p className="min-h-[48px]">{desc}</p>
-                  <div className="grid grid-cols-3 gap-2 text-sm">
+                  <Input
+                    value={p.name}
+                    onChange={(e) => update(i, { name: e.target.value })}
+                    placeholder="Imię bohatera"
+                    className="bg-[#0c120c] text-[#f0e7cf] border-[#233823] placeholder:text-[#8ba08b]"
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    {classes.map(({ cls, icon: Icon }) => (
+                      <Button
+                        key={cls}
+                        onClick={() => update(i, { cls })}
+                        className={cn(
+                          'justify-start bg-[#2f4a2f] text-[#f0e7cf] border border-[#1f2f1f]',
+                          p.cls === cls && 'bg-[#576f2e] hover:bg-[#4c6128]'
+                        )}
+                      >
+                        <Icon className="h-4 w-4 mr-2" />
+                        {cls}
+                      </Button>
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-sm mt-1">
                     <StatPill label="HP" value={stats.hpBase} icon={Heart} />
                     <StatPill label="Mana" value={stats.manaBase} icon={FlaskConical} />
-                    <StatPill label="Sila" value={stats.strength} icon={Swords} />
-                    <StatPill label="Zrecz" value={stats.dexterity} icon={Dice5} />
+                    <StatPill label="Siła" value={stats.strength} icon={Swords} />
+                    <StatPill label="Zręcz" value={stats.dexterity} icon={Dice5} />
                     <StatPill label="Mądrość" value={stats.wisdom} icon={BookOpen} />
-                    <StatPill label="Sakiewka" value={stats.gold} icon={Coins} />
+                    <StatPill label="Złoto" value={stats.gold} icon={Coins} />
                   </div>
-                  <Button onClick={() => onSelect(cls)} className="w-full mt-3 bg-[#6e5b3d] hover:bg-[#5d4c32] text-[#f7f2e6]">{'Wybierz'}</Button>
                 </CardContent>
               </Card>
             )
@@ -328,22 +473,19 @@ function StatPill({ label, value, icon: Icon }: { label: string; value: number; 
 
 function GameArea({
   state,
+  isSending,
   onQuick,
   onSubmit,
-  isSending,
+  onSetActive,
 }: {
   state: GameState
+  isSending: boolean
   onQuick: (a: string) => void
   onSubmit: (text: string) => void
-  isSending: boolean
+  onSetActive: (idx: number) => void
 }) {
   const [text, setText] = useState('')
-
-  const endMsg = state.isOver
-    ? state.outcome === 'win'
-      ? 'Zwycięstwo! Cel misji został osiągnięty.'
-      : 'Porażka... Twoje HP spadło do zera.'
-    : null
+  const endMsg = state.isOver ? (state.outcome === 'win' ? 'Zwycięstwo! Cel misji został osiągnięty.' : 'Porażka... Drużyna pada bez sił.') : null
 
   return (
     <section className="mx-auto max-w-6xl px-4 py-6 grid gap-4 md:grid-cols-[2fr,1fr]">
@@ -356,7 +498,8 @@ function GameArea({
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ScrollArea className="h-[46vh] md:h-[48vh] pr-3">
+            <PartyBar state={state} onSetActive={onSetActive} />
+            <ScrollArea className="h-[42vh] md:h-[44vh] pr-3 mt-3">
               <div className="space-y-3">
                 {state.messages.map((m, i) => (
                   <div key={i} className={cn('leading-6', m.role === 'assistant' ? 'text-[#e7dec5]' : 'text-[#d0c7ad]')}>
@@ -373,85 +516,58 @@ function GameArea({
             <Separator className="my-3 bg-[#3d3021]" />
             <div className="flex flex-wrap gap-2 mb-3">
               {QUICK_ACTIONS.map((q) => (
-                <Button
-                  key={q.key}
-                  onClick={() => onQuick(q.label)}
-                  disabled={isSending || state.isOver}
-                  className="bg-[#2f4a2f] hover:bg-[#253b25] text-[#f0e7cf] border border-[#1f2f1f] h-9 px-2 gap-1"
-                >
+                <Button key={q.key} onClick={() => onQuick(q.label)} disabled={isSending || state.isOver} className="bg-[#2f4a2f] hover:bg-[#253b25] text-[#f0e7cf] border border-[#1f2f1f] h-9 px-2 gap-1">
                   <q.icon className="h-4 w-4" />
                   <span className="text-sm">{q.label}</span>
                 </Button>
               ))}
             </div>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                if (!text.trim()) return
-                onSubmit(text.trim())
-                setText('')
-              }}
-              className="flex gap-2"
-            >
+            <form onSubmit={(e) => { e.preventDefault(); if (!text.trim()) return; onSubmit(text.trim()); setText('') }} className="flex gap-2">
               <Input
                 aria-label="Akcja gracza"
-                placeholder="Opisz swoją akcję (np. 'Skradam się do strażnika' lub 'Atakuję wilka')"
+                placeholder={`Akcja (${state.players[state.activeIndex]?.name || 'Bohater'})...`}
                 value={text}
                 onChange={(e) => setText(e.target.value)}
                 disabled={isSending || state.isOver}
                 className="bg-[#0c120c] text-[#f0e7cf] border-[#233823] placeholder:text-[#8ba08b]"
               />
-              <Button
-                type="submit"
-                disabled={isSending || state.isOver || !text.trim()}
-                className="bg-[#6e5b3d] hover:bg-[#5d4c32] text-[#f7f2e6] min-w-[112px]"
-              >
+              <Button type="submit" disabled={isSending || state.isOver || !text.trim()} className="bg-[#6e5b3d] hover:bg-[#5d4c32] text-[#f7f2e6] min-w-[112px]">
                 {isSending ? 'Wysyłanie...' : 'Wykonaj'}
               </Button>
             </form>
-
-            <div className="mt-4 flex flex-col sm:flex-row gap-2 sm:items-center">
-              <SaveInline />
-              <p className="text-xs text-[#9fb19f] sm:ml-2">{'Zapisy są przechowywane lokalnie i na serwerze (sesja demo).'}</p>
+            <div className="mt-3 text-xs text-[#9fb19f]">
+              {state.world && <>Świat: <b>{state.world.name}</b>. </>}
+              {state.goal && <>Cel: {state.goal}</>}
             </div>
           </CardContent>
         </Card>
       </div>
-
       <SidePanel state={state} />
     </section>
   )
 }
 
-function SaveInline() {
-  const [name, setName] = useState('Moja Przygoda')
+function PartyBar({ state, onSetActive }: { state: GameState; onSetActive: (i: number) => void }) {
   return (
-    <div className="flex items-center gap-2">
-      <Input
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder="Nazwa zapisu"
-        className="bg-[#0c120c] text-[#f0e7cf] border-[#233823] placeholder:text-[#8ba08b]"
-      />
-      <Button
-        onClick={() => {
-          const state = JSON.parse(localStorage.getItem('rpg_state') || 'null')
-          if (!state) return
-          const snapshot: GameSave = { id: crypto.randomUUID(), name: name || `Przygoda ${new Date().toLocaleString()}`, createdAt: Date.now(), state }
-          const saves = JSON.parse(localStorage.getItem('rpg_saves') || '[]') as GameSave[]
-          localStorage.setItem('rpg_saves', JSON.stringify([snapshot, ...saves].slice(0, 20)))
-          const sessionId = localStorage.getItem('rpg_session_id') || ''
-          fetch('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, save: snapshot }) }).catch(() => {})
-        }}
-        className="bg-[#576f2e] hover:bg-[#4c6128] text-[#f7f2e6]"
-      >
-        {'Zapisz'}
-      </Button>
+    <div className="flex gap-2 overflow-x-auto">
+      {state.players.map((p, i) => {
+        const active = i === state.activeIndex
+        const hpPct = Math.round((p.hp / Math.max(1, p.stats.hpBase)) * 100)
+        const manaPct = Math.round((p.mana / Math.max(1, p.stats.manaBase)) * 100)
+        return (
+          <button key={p.id} onClick={() => onSetActive(i)} className={cn('min-w-[180px] text-left rounded border px-3 py-2 bg-[#161f16] border-[#3d3021]', active && 'ring-2 ring-[#6e5b3d]')}>
+            <div className="font-semibold text-[#f0e7cf]">{p.name} <span className="text-[#c7bb9d] text-xs">({p.cls})</span></div>
+            <div className="mt-1 h-1.5 bg-black/40 rounded overflow-hidden border border-[#3d3021]"><div className="h-full bg-[#a33b3b]" style={{ width: `${hpPct}%` }} /></div>
+            <div className="mt-1 h-1.5 bg-black/40 rounded overflow-hidden border border-[#3d3021]"><div className="h-full bg-[#3b8aa3]" style={{ width: `${manaPct}%` }} /></div>
+          </button>
+        )
+      })}
     </div>
   )
 }
 
 function SidePanel({ state }: { state: GameState }) {
+  const active = state.players[state.activeIndex]
   return (
     <div className="space-y-4">
       <Card className="bg-[#11150f] border-[#3d3021]">
@@ -462,16 +578,22 @@ function SidePanel({ state }: { state: GameState }) {
           </CardTitle>
         </CardHeader>
         <CardContent className="text-[#d8cfb5]">
-          <div className="grid grid-cols-2 gap-2">
-            <Bar label="HP" value={state.hp} max={state.stats.hpBase} color="#a33b3b" icon={Heart} />
-            <Bar label="Mana" value={state.mana} max={state.stats.manaBase} color="#3b8aa3" icon={FlaskConical} />
-          </div>
-          <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
-            <StatPill label="Siła" value={state.stats.strength} icon={Swords} />
-            <StatPill label="Zręcz." value={state.stats.dexterity} icon={Dice5} />
-            <StatPill label="Mądrość" value={state.stats.wisdom} icon={BookOpen} />
-          </div>
-          {state.playerClass && <p className="mt-2 text-xs text-[#bdb397]">{'Klasa: '}<b>{state.playerClass}</b></p>}
+          {active ? (
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                <Bar label="HP" value={active.hp} max={active.stats.hpBase} color="#a33b3b" icon={Heart} />
+                <Bar label="Mana" value={active.mana} max={active.stats.manaBase} color="#3b8aa3" icon={FlaskConical} />
+              </div>
+              <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
+                <StatPill label="Siła" value={active.stats.strength} icon={Swords} />
+                <StatPill label="Zręcz." value={active.stats.dexterity} icon={Dice5} />
+                <StatPill label="Mądrość" value={active.stats.wisdom} icon={BookOpen} />
+              </div>
+              <p className="mt-2 text-xs text-[#bdb397]">{'Klasa: '}<b>{active.cls}</b></p>
+            </>
+          ) : (
+            <p className="text-[#9fb19f]">{'Brak aktywnego bohatera.'}</p>
+          )}
         </CardContent>
       </Card>
 
@@ -479,13 +601,12 @@ function SidePanel({ state }: { state: GameState }) {
         <CardHeader className="pb-2">
           <CardTitle className="text-[#f0e7cf] flex items-center gap-2">
             <BackpackIcon />
-            {'Ekwipunek'}
+            {'Ekwipunek (aktywny)'}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <ul className="space-y-1 text-[#d8cfb5] text-sm">
-            {state.inventory.length === 0 && <li className="text-[#9fb19f]">{'Pusto...'}</li>}
-            {state.inventory.map((it, i) => (
+            {!active || active.inventory.length === 0 ? <li className="text-[#9fb19f]">{'Pusto...'}</li> : active.inventory.map((it, i) => (
               <li key={i} className="flex items-center gap-2">
                 <span className="h-2 w-2 rounded-sm bg-[#6e5b3d] inline-block border border-[#3d3021]" />
                 {it}
@@ -504,11 +625,7 @@ function SidePanel({ state }: { state: GameState }) {
         </CardHeader>
         <CardContent>
           <div className="text-[#cfc5ab] text-sm">
-            {state.goal ? (
-              <p className="mb-2"><span className="text-[#9fb19f]">{'Cel: '}</span>{state.goal}</p>
-            ) : (
-              <p className="text-[#9fb19f]">{'Cel misji zostanie wkrótce ustalony.'}</p>
-            )}
+            {state.goal ? <p className="mb-2"><span className="text-[#9fb19f]">{'Cel: '}</span>{state.goal}</p> : <p className="text-[#9fb19f]">{'Cel misji zostanie wkrótce ustalony.'}</p>}
             <ul className="list-disc ml-5 space-y-1">
               {state.questLog.map((q, i) => (<li key={i}>{q}</li>))}
             </ul>
@@ -559,26 +676,8 @@ function SavedList() {
                 <div className="text-[#f0e7cf] font-medium">{s.name}</div>
                 <div className="text-[#9fb19f] text-xs">{new Date(s.createdAt).toLocaleString()}</div>
               </div>
-              <Button
-                onClick={() => {
-                  localStorage.setItem('rpg_state', JSON.stringify(s.state))
-                  window.location.reload()
-                }}
-                className="bg-[#576f2e] hover:bg-[#4c6128] text-[#f7f2e6]"
-              >
-                {'Wczytaj'}
-              </Button>
-              <Button
-                onClick={() => {
-                  const all = JSON.parse(localStorage.getItem('rpg_saves') || '[]') as GameSave[]
-                  localStorage.setItem('rpg_saves', JSON.stringify(all.filter(x => x.id !== s.id)))
-                  window.location.reload()
-                }}
-                variant="secondary"
-                className="bg-[#6e3b3b] hover:bg-[#5a3232] text-[#f7f2e6] border border-[#3d3021]"
-              >
-                {'Usuń'}
-              </Button>
+              <Button onClick={() => { localStorage.setItem('rpg_state', JSON.stringify(s.state)); window.location.reload() }} className="bg-[#576f2e] hover:bg-[#4c6128] text-[#f7f2e6]">{'Wczytaj'}</Button>
+              <Button onClick={() => { const all = JSON.parse(localStorage.getItem('rpg_saves') || '[]') as GameSave[]; localStorage.setItem('rpg_saves', JSON.stringify(all.filter(x => x.id !== s.id))); window.location.reload() }} variant="secondary" className="bg-[#6e3b3b] hover:bg-[#5a3232] text-[#f7f2e6] border border-[#3d3021]">{'Usuń'}</Button>
             </CardContent>
           </Card>
         ))}
